@@ -1,0 +1,4 @@
+lxml
+python-docx
+beautifulsoup4
+fire
