@@ -22,6 +22,7 @@ re_kuo_embed = re.compile(r'「[^「」]+[『』\u3000，。；][^「」]*」')
 re_kuo_dup = re.compile('「[^「」『』]{0,5}『[^「」『』]+』[等者]?」')
 re_kuo_long = re.compile('「[^「」]{16,100}」')
 re_kuo_sign = re.compile('[「」『』]')
+re_kuo_end = re.compile('[，：；、]”$')
 re_kp_level = re.compile(r'^\d+')
 re_tag1 = re.compile('“([^“”「」，][^“”「」]+)”')
 re_tag2 = re.compile('[言引▲]+([^者。”」，][^者。”」]+?)等?[，。]?[者下中]')
@@ -122,7 +123,7 @@ def set_outline_level(p, level):
     """
     设置文档段落的大纲级别
     :param p: 段落
-    :param level: 大纲级别，1~9
+    :param level: 大纲级别，1~9，0为正文文本
     """
     p_element = p._p
     p_pr = p_element.find(qn('w:pPr'))
@@ -133,7 +134,7 @@ def set_outline_level(p, level):
     if outline_lvl is not None:
         p_pr.remove(outline_lvl)
     new_outline_lvl = oxml.OxmlElement('w:outlineLvl')
-    new_outline_lvl.set(qn('w:val'), str(min(8, level - 1)))
+    new_outline_lvl.set(qn('w:val'), str(min(8, level - 1)) if level else '-1')
     p_pr.append(new_outline_lvl)
 
 
@@ -159,6 +160,8 @@ def output_doc(juan, doc, book, types):
         if 'xu' in p_cls:
             p_types.add('xu')
         if (p.name == 'p' or 'text_paragraph' in p_cls or 'juan-begin' in p_cls) and p.text:
+            if 'head' in p_cls and '2.1.3 約所詮辨異' in p.text:
+                add_final_vol(doc)
             dp = output_p(doc, p, p_types)
             count += 1
         elif p.name == 'div':
@@ -169,19 +172,24 @@ def output_doc(juan, doc, book, types):
                 dp = output_p(doc, p, p_types)
                 count += 1
 
-        pick_0236(juan, doc, dp)
         if dp:
-            m = re_p_tag.search(dp.text)
-            tag = m.group() if m else ''
-            text = dp.text[len(tag):]
-            dp.clear()
-            if data['test'] and dp.style.name[0] in '疏钞经':
-                dp.add_run(f"{data['p_n']:04d}{'' if tag else ' '}", '段号')
-            if tag:
-                dp.add_run(tag)
-            add_runs_u(dp, text, data['test'], False)
+            pick_0236(juan, doc, dp)
+            mark_shu_chao_underline(dp)
 
     return count
+
+
+def mark_shu_chao_underline(dp):
+    """根据疏钞段落的【标记】设置下划线"""
+    m = re_p_tag.search(dp.text)
+    tag = m.group() if m else ''
+    text = dp.text[len(tag):]
+    dp.clear()
+    if data['test'] and dp.style.name[0] in '疏钞经':
+        dp.add_run(f"{data['p_n']:04d}{'' if tag else ' '}", '段号')
+    if tag:
+        dp.add_run(tag)
+    add_runs_u(dp, text, data['test'] and data.get('mark_shu'), False)
 
 
 def output_p(doc, el, types):
@@ -206,7 +214,7 @@ def output_p(doc, el, types):
     text = re_kuo_dup.sub(lambda _: '「' + re_kuo_sign.sub('', _.group()) + '」', el.text.strip())
     text = re_kuo_embed.sub(fix_kuo_embed, text)
     text = re_kuo_long.sub(lambda _: _.group().replace('「', '“').replace('」', '”'), text)
-    text = re_kuo_sign.sub('', text)
+    text = re_kuo_end.sub('”', re_kuo_sign.sub('', text))
 
     level = kp and re_kp_level.search(text)
     m = re_p_tag2.search(text)
@@ -230,7 +238,21 @@ def output_p(doc, el, types):
     return p
 
 
+def add_final_vol(doc):
+    """添加下册分隔段落"""
+    p = doc.add_paragraph('华严经疏钞附会玄记合编上册(终)', '疏')
+    p.alignment = doc_t.WD_PARAGRAPH_ALIGNMENT.RIGHT
+
+    p = doc.add_paragraph('华严经疏钞附会玄记合编 下册', '科判')
+    p.alignment = doc_t.WD_PARAGRAPH_ALIGNMENT.CENTER
+    set_outline_level(p, 1)
+
+    p = doc.add_paragraph('7 …2.2.3.2.3 立教開宗', '科判')
+    set_outline_level(p, 2)
+
+
 def fix_kuo_embed(m):
+    """修正嵌套引号的文本"""
     text = re.sub('『[^『』]{0,4}』', lambda _: _.group()[1: -1], m.group())
     return text.replace('『', '‘').replace('』', '’').replace('「', '“').replace('」', '”')
 
@@ -245,9 +267,9 @@ def pick_0236(juan, doc, p):
     """
     scj = p and p.style.name[0] in '疏钞经'
     if p:
-        if scj and data['last_p_type'] != p.style.name and not p.text.startswith('【'):
+        if scj and data.get('last_p_type') != p.style.name and not p.text.startswith('【'):
             p.text = f'【{p.style.name}】' + p.text  # 类型改变后加段首标注
-        if scj and '会' in data['last_p_type']:  # 疏钞与前面的会隔开
+        if scj and '会' in data.get('last_p_type', ''):  # 疏钞与前面的会隔开
             p.insert_paragraph_before('', '空行')
         data['last_p_type'] = data['last_type0'] = p.style.name
     if not scj:
@@ -269,6 +291,7 @@ def pick_0236(juan, doc, p):
 
 
 def pick_loop(doc, p, juan, mode, mis_i, first_i, count, text0):
+    """pick_0236的内部循环"""
     orig_num = 0
     for i, pu in enumerate(data['pu']):
         if mode == 0 and pu['para'] == 0:
@@ -310,14 +333,24 @@ def match_ref(juan, doc, p, pu, text0, test=0):
     :param test: 创建模式，0-匹配并创建，1-匹配但不创建，2-直接创建
     :return: (dp, ts, word0) 创建的文档段落对象、各个可能的关键词、第一个匹配的关键词
     """
-    orgs, txt0, pu_t = [], text0, pu['text']
+    first_w, orgs, exists, ts = find_terms(p, pu, text0)
+
+    dp = add_pu_para(juan, doc, p, pu, orgs, exists, test, first_w)
+    [orgs.remove(s) for s in exists if s in orgs]
+
+    return dp, ts, orgs and orgs[0]
+
+
+def find_terms(p, pu, text0):
+    """查找匹配词组"""
+    orgs, exists, txt0, pu_t = [], [], text0, pu['text']
     force = pu.get('force', [])
     a = re_tag1.findall(pu_t)
     b = re_tag2.findall(pu_t)
     c = re_tag3.findall(pu_t)
     ts = [str(t).strip(punc_tail)
           for t in sorted(a + b + c, key=len, reverse=True) if len(t) < 20]
-    min_i, first_w = 0, ''
+    min_i, first_w, tps = 0, '', []
 
     for t in ts:
         tp = t
@@ -328,22 +361,28 @@ def match_ref(juan, doc, p, pu, text0, test=0):
         t1 = re_term.sub(lambda _: _.group()[1:-1], t)
         if t1 != t and t1 in ts and tp == t:
             continue
-        if len(t) > 1 and t not in orgs and t not in pu.get(
-                'skip', []) and '【' + tp not in p.text and tp + '】' not in p.text:
-            s = re_punc.sub('', tp)
-            if s in txt0:  # 在疏钞中也有则加到orgs，add_pu_para 中再匹配force中的疏钞文本
-                orgs.append(t)
-                txt0 = txt0.replace(s, '')
+        s = len(t) > 1 and t not in orgs and t not in pu.get('skip', []) and re_punc.sub('', tp)
+        if s and s in text0:
+            tps.append((t, tp, s))
+            orgs.append(t)
             i = pu_t.index(t)
             if min_i > i or not first_w:
                 min_i = i
                 first_w = t
+    ts = [t for t in tps if t[0] == first_w] + [t for t in tps if t[0] != first_w]
+    orgs = []
+    for t, tp, s in ts:
+        exist = s not in txt0 or '【' + tp in p.text or tp + '】' in p.text
+        if not exist and s in txt0:  # 在疏钞中也有则加到orgs，add_pu_para 中再匹配force中的疏钞文本
+            orgs.append(t)
+            txt0 = txt0.replace(s, '')
+        elif exist:
+            orgs.append(t)
+            exists.append(t)
+    return first_w, orgs, exists, ts
 
-    dp = add_pu_para(juan, doc, p, pu, orgs, test, first_w)
-    return dp, ts, orgs and orgs[0]
 
-
-def add_pu_para(juan, doc, p, pu, orgs, test=0, first_w=''):
+def add_pu_para(juan, doc, p, pu, orgs, exists, test=0, first_w=''):
     """
     创建会玄记段落
     :param juan: 疏钞的卷号
@@ -351,61 +390,71 @@ def add_pu_para(juan, doc, p, pu, orgs, test=0, first_w=''):
     :param p: 疏钞段落对象
     :param pu: 会玄记段落数据
     :param orgs: 所有已匹配的关键词
+    :param exists: 疏钞段落中不能再接受的关键词，同时存在于orgs
     :param test: 创建模式，0-匹配并创建，1-匹配但不创建，2-直接创建
     :param first_w: 会玄记段落中第一个匹配的关键词
     :return: 创建的文档段落对象
     """
     force = pu.get('force', [])
     if force:
-        update_force_terms(force, orgs, p, pu)
-
+        update_terms_by_force(force, orgs, p, pu)
     if pu.get('skip'):
         [orgs.remove(s) for s in pu['skip'] if s in orgs]
+
     if (orgs and pu['para'] != data['p_n'] and not test) or test == 2:
         style = pu['type']
         assert style == {'鈔': '钞', '經': '经'}.get(style, style)
-        if pu['para'] == 0:
+        if pu['para'] == 0 and set(orgs) - set(exists):
             pu_text, pre = pu['text'], ''
-            first_miss = first_w and first_w not in orgs
-            if first_miss:
+            first_miss = first_w and (first_w not in orgs and first_w in exists)
+            if first_miss and first_w not in orgs:
                 orgs.insert(0, first_w)
             for org in list(orgs):
                 if not force and ('【' + org in p.text or org + '】' in p.text):
-                    orgs.remove(org)
-                    continue
-                p.text = replace_term(p.text, org)
+                    exists.append(org)
+                if org not in exists:
+                    p.text = replace_term(p.text, org)
                 s = f'言{org}者'
-                pu_text = replace_term(pu_text, s if s in pu_text else org)
+                s = s if s in pu_text else org
+                if org in exists and s not in exists:
+                    exists.append(s)
+                pu_text = replace_term(pu_text, s)
 
             if not orgs and test != 2:
                 return
-            if force and not test:
-                for i, s in enumerate(force):
-                    if i % 2 == 1:
-                        p.text = replace_term(p.text, s)
-            if data['last_p_type'] != style + '会':
-                pre = f"【会{'' if data['last_p_type'].replace('会', '') == style else style}】"
-                if force and data['last_p_type'][0] != style:
-                    print(pu['head'], style, ','.join(force), data['last_p_type'], data['p_n'])
-
-            data.update(dict(last_p_type=style + '会', last_pu_id=pu['id']))
-            pu.update(dict(para=data['p_n'], juan0=juan,
-                           words=orgs, type0=data['last_type0']))
-            dp = doc.add_paragraph('', style + '会')
-            if data['test']:
-                dp.add_run(f"{pu['id']:04d}_{pu['head']}{'' if pre else ' '}", '段号-会')
-            dp.add_run(pre)
-            pu_text = re.sub('▲(。|[疏鈔]：)+', '▲', pu_text)
-            add_runs_u(dp, re.sub('^▲', '', pu_text) if pre else pu_text,
-                       bold=data['test'], first_miss=first_miss)
-            if first_miss:
-                pu['first_miss'] = orgs.pop(0)
-            if pu.get('has_kp'):
-                dp.add_run('(科判略)', 'note')
-            return dp
+            return add_pu_p(doc, p, pu, orgs, exists, juan, pu_text, pre, style, first_miss, force, test)
 
 
-def update_force_terms(force, orgs, p, pu):
+def add_pu_p(doc, p, pu, orgs, exists, juan, pu_text, pre, style, first_miss, force, test):
+    """将一个会玄记段落添加到文档"""
+    if force and not test:
+        for i, s in enumerate(force):
+            if i % 2 == 1:
+                p.text = replace_term(p.text, s)
+    if data['last_p_type'] != style + '会':
+        pre = f"【会{'' if data['last_p_type'].replace('会', '') == style else style}】"
+        if force and data['last_p_type'][0] != style:
+            print(f"{style} != {data['last_p_type']}", pu['head'], style, ','.join(force), data['p_n'])
+    data.update(dict(last_p_type=style + '会', last_pu_id=pu['id']))
+    pu.update(dict(para=data['p_n'], juan0=juan,
+                   words=orgs, type0=data['last_type0']))
+    dp = doc.add_paragraph('', '会')
+    if data['test']:
+        head = '_' + pu['head'] and ''
+        dp.add_run(f"{pu['id']:04d}{head}{'' if pre else ' '}", '段号-会')
+    dp.add_run(pre)
+    pu_text = re.sub('▲(。|[疏鈔]：)+', '▲', pu_text)
+    add_runs_u(dp, re.sub('^▲', '', pu_text) if pre else pu_text,
+               bold=data['test'], first_miss=first_miss, exists=exists)
+    if first_miss:
+        pu['first_miss'] = orgs.pop(0)
+    if pu.get('has_kp'):
+        dp.add_run('(科判略)', 'note')
+    return dp
+
+
+def update_terms_by_force(force, orgs, p, pu):
+    """ 根据会玄记中p元素的force属性(匹配文本)更新当前匹配词组 """
     if len(force) % 2 != 0:
         assert 0, f"{pu['head']} force 文本两个一组，逗号分隔"
     ins_i = 0
@@ -420,7 +469,7 @@ def update_force_terms(force, orgs, p, pu):
                     ins_i += 1
             else:
                 s = re_punc.sub('', force[i + 1])
-                if s in re_punc.sub('', p.text) and not re.search('^[“○]|[；。，、]$', force[i + 1]):
+                if s in re_punc.sub('', p.text) and not re.search('^[“○。]|[；。，、]$', force[i + 1]):
                     print(f"{pu['head']} 的 force 标点可能需修正", data['p_n'], force[i + 1] + '\n',
                           p.text[p.text.index(s[0]):][:150])
                 orgs.clear()
@@ -438,7 +487,7 @@ def replace_term(text, w):
     return text.replace(m.group(), m.group().replace(w, f'【{w}】'), 1) if m else text
 
 
-def add_runs_u(p, text, underline=True, bold=True, first_miss=False):
+def add_runs_u(p, text, underline=True, bold=True, first_miss=False, exists=None):
     """
     根据段落文本中的【】标记，向文档段落对象添加普通文本和下划线文本
     :param p: 文档段落对象
@@ -446,6 +495,7 @@ def add_runs_u(p, text, underline=True, bold=True, first_miss=False):
     :param underline: 是否加下划线
     :param bold: 是否对下划线文本加粗
     :param first_miss: 会玄记段落中第一个关键词是否与疏钞段落匹配
+    :param exists: 疏钞段落中不能再接受的关键词
     """
     texts = re_p_tags.split(text)
     n, last = 0, None
@@ -466,7 +516,7 @@ def add_runs_u(p, text, underline=True, bold=True, first_miss=False):
                     first_miss = False
                     r.italic = True
                 r.underline = True
-                r.bold = bold
+                r.bold = bold and not (exists and s in exists)
             n = j + 1
         if txt:
             last = p.add_run(txt)
@@ -536,6 +586,7 @@ def load_0236_div(body, start, status, pu):
 
 
 def load_0236_p(status, p_cls, pu, p):
+    """ 解析会玄记网页的一个段落 """
     text = re.sub(r'\[[A-Z0-9]+]', '', p.text.strip())
     m = re.search('^[▲○]?([疏鈔钞])云?[：「]', text)
     status['p_type'] = m.group(1) if m else status.get('p_type', '钞')
@@ -631,9 +682,19 @@ def save_used(pu):
             h0 = h
 
 
-def main(release=0, min_juan0=0, max_juan0=10, kp_build=0, gen_origin=0, diff_hui=0):
+def main(release=0, min_juan0=0, max_juan0=10, kp_build=0, gen_origin=0, diff_hui=0, mark_shu=1):
+    """
+    文档生成的主函数
+    :param release: 是否生成发布用的文档
+    :param min_juan0: 是否生成校对文档的起始卷号
+    :param max_juan0: 是否生成校对文档的结束卷号
+    :param kp_build: 是否重新生成科判json文件
+    :param gen_origin: 是否根据下载的 X0236 网页生成会玄记原始内容文件 pu-origin.csv
+    :param diff_hui: 是否根据会玄记原始内容文件 pu-origin.csv 对比当前 hui 下的内容
+    :param mark_shu: 生成校对文档时是否将会玄记引用词在疏钞段中匹配文本加下划线
+    """
     data.update(dict(test=not release, gen_origin=gen_origin, diff_hui=diff_hui,
-                     min_juan0=min_juan0, max_juan0=max_juan0))
+                     min_juan0=min_juan0, max_juan0=max_juan0, mark_shu=mark_shu))
     if data.get('diff_hui'):
         with open('pu-origin.csv', encoding='utf-8') as f:
             data['origin'] = [r.strip().split(',') for r in f.readlines()[1:]]
