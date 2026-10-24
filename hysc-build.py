@@ -10,6 +10,8 @@ import docx.enum.text as doc_t
 import difflib as df
 
 punc_tail = '，。：；？“”‘’「」○'
+re_cjk_b = re.compile(r'[\U00020000-\U0002a6d6]')
+re_cjk_c = re.compile(r'[\U0002a700-\U0002fa1d\U000e0100-\U000e0176]')
 re_punc = re.compile('[，。：；？“”‘’「」○《》〈〉．、▲]')
 re_kp_num = re.compile(r'^(\d+)(\.\d+)')
 re_p_tag = re.compile('^【[^】]+】')
@@ -519,7 +521,23 @@ def add_runs_u(p, text, underline=True, bold=True, first_miss=False, exists=None
                 r.bold = bold and not (exists and s in exists)
             n = j + 1
         if txt:
-            last = p.add_run(txt)
+            cjk_b, cjk_c = re_cjk_b.findall(txt), re_cjk_c.findall(txt)
+            if cjk_b or cjk_c:
+                s = ''
+                for c in list(txt):
+                    if c in cjk_b or c in cjk_c:
+                        if s:
+                            last, s = p.add_run(s), ''
+                        if c in cjk_c:
+                            p.add_run(c, 'cjk-c')
+                        elif c in cjk_b:
+                            p.add_run(c, 'cjk-b')
+                    else:
+                        s += c
+                if s:
+                    last = p.add_run(s)
+            else:
+                last = p.add_run(txt)
         n += len(txt)
 
 
@@ -538,9 +556,10 @@ def load_0236(html_dir):
         if juan < 0 or (data['test'] and juan < data.get('start_juan', 0)):
             continue
         with open(fn, encoding='utf-8') as f:
-            soup = BeautifulSoup(f.read().replace('[＊]', ''), 'html.parser')
+            soup = BeautifulSoup(f.read().replace('[＊]', '').replace(
+                '》、《', '》《'), 'html.parser')
         body = soup.find('div', id='body')
-        for s in body.select('.no-marker'):
+        for s in (body.select('.no-marker') or []):
             p = s.previous_sibling
             while p and p.name != 'p':
                 p = p.previous_sibling
@@ -715,7 +734,7 @@ def main(release=0, min_juan0=0, max_juan0=10, kp_build=0, gen_origin=0, diff_hu
             continue
         with open(fn, encoding='utf-8') as f:
             soup = re_kuo_kuo.sub(lambda m: m.group(2) + m.group(3), f.read())
-            soup = BeautifulSoup(soup, 'html.parser')
+            soup = BeautifulSoup(soup.replace('》、《', '》《'), 'html.parser')
         if juan == 0 and kp_build:
             try:
                 read_kp(soup, kp_map)
