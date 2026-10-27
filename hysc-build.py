@@ -36,7 +36,7 @@ re_diff_ad = re.compile(r'(\+ .+\n){2,9999}')
 re_diff_rm = re.compile(r'(- .+\n){2,9999}')
 re_cmp8 = re.compile(r'[\s\n=+-]')
 
-data = {}
+data = dict(p_n=0, pu=[])
 
 
 def diff_text(a, b):
@@ -76,7 +76,8 @@ def read_kp_ul(ul, kp_map, siblings, base_nums, level):
     for li in ul.find_all('li', class_='jstree-node', recursive=False):
         a = li.find('a', class_='jstree-anchor', recursive=False)
         target, file = a.attrs['target_content'], a.attrs['html_file']
-        id2node = kp_map['id2node'][file[:-5]] = kp_map['id2node'].get(file[:-5], {})
+        k = re.search(r'\d+', file).group()
+        id2node = kp_map['id2node'][k] = kp_map['id2node'].get(k, {})
         node_id = target[1:]
         assert target.startswith('#') and file[-5:] == '.html'
         assert node_id not in id2node
@@ -213,10 +214,9 @@ def output_p(doc, el, types):
         elif 'jing' in types or re_jing.search(el.text):
             p_style = '经'
 
-    text = re_kuo_dup.sub(lambda _: '「' + re_kuo_sign.sub('', _.group()) + '」', el.text.strip())
-    text = re_kuo_embed.sub(fix_kuo_embed, text)
-    text = re_kuo_long.sub(lambda _: _.group().replace('「', '“').replace('」', '”'), text)
-    text = re_kuo_end.sub('”', re_kuo_sign.sub('', text))
+    for r in el.find_all('ruby'):
+        r.string = f'({r.text.strip()})'
+    text = fix_kuo(el.text)
 
     level = kp and re_kp_level.search(text)
     m = re_p_tag2.search(text)
@@ -240,6 +240,21 @@ def output_p(doc, el, types):
     return p
 
 
+def fix_kuo(text):
+    """修正段落文本中的括号"""
+    text = re_kuo_dup.sub(lambda _: '「' + re_kuo_sign.sub('', _.group()) + '」', text.strip())
+    text = re_kuo_embed.sub(fix_kuo_embed, text)
+    text = re_kuo_long.sub(lambda _: _.group().replace('「', '“').replace('」', '”'), text)
+    text = re_kuo_end.sub('”', re_kuo_sign.sub('', text))
+    return text
+
+
+def fix_kuo_embed(m):
+    """修正嵌套引号的文本"""
+    text = re.sub('『[^『』]{0,4}』', lambda _: _.group()[1: -1], m.group())
+    return text.replace('『', '‘').replace('』', '’').replace('「', '“').replace('」', '”')
+
+
 def add_final_vol(doc):
     """添加下册分隔段落"""
     p = doc.add_paragraph('华严经疏钞附会玄记合编上册(终)', '疏')
@@ -251,12 +266,6 @@ def add_final_vol(doc):
 
     p = doc.add_paragraph('7 …2.2.3.2.3 立教開宗', '科判')
     set_outline_level(p, 2)
-
-
-def fix_kuo_embed(m):
-    """修正嵌套引号的文本"""
-    text = re.sub('『[^『』]{0,4}』', lambda _: _.group()[1: -1], m.group())
-    return text.replace('『', '‘').replace('』', '’').replace('「', '“').replace('」', '”')
 
 
 def pick_0236(juan, doc, p):
@@ -743,13 +752,13 @@ def main(release=0, min_juan0=0, max_juan0=10, kp_build=0, gen_origin=0, diff_hu
         book = soup.find('div', id='main')
         add_head_level(kp_map, book, str(juan))
         if juan > 0:
-            for s in book.select('ruby,.juan-begin>p,.juan-begin>.text_paragraph,.juan-end,.noteAnchor,.double-circle'):
+            for s in book.select('.juan-begin>p,.juan-begin>.text_paragraph,.juan-end,.noteAnchor,.double-circle'):
                 s.extract()
             output_doc(juan, doc, book, set())
 
     if kp_build:
         with open('hysc.json', 'w', encoding='utf-8') as f:
-            json.dump(kp_map, f, ensure_ascii=False, indent=2)
+            json.dump(dict(tree=kp_map['tree'], id2node=kp_map['id2node']), f, ensure_ascii=False, indent=2)
     else:
         doc.save(f"合编{'' if data['test'] else '-'}.docx")
         save_used(data['pu'])
