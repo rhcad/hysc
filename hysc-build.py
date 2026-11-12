@@ -16,7 +16,7 @@ re_punc = re.compile('[，。：；？“”‘’「」○《》〈〉．、▲
 re_kp_num = re.compile(r'^(\d+)(\.\d+)')
 re_p_tag = re.compile('^【[^】]+】')
 re_p_tag2 = re.compile('^([疏鈔經钞经]序?)[：「]')
-re_p_tags = re.compile('【[^】]+】')
+re_p_tags = re.compile(r'【[^】]+】|\(![^)]+\)')
 
 re_jing = re.compile('^經序?：')
 re_kuo_kuo = re.compile('([，、])([』」])([『「])')
@@ -114,12 +114,13 @@ def add_head_level(kp_map, book, juan):
         a = book.select(f"a[name={node['target']}]")
         if a:
             head = a[0]
-            while head.name != 'p' or 'head' not in head.attrs['class']:
+            while head and (head.name != 'p' or 'head' not in head.attrs['class']):
                 head = head.next_element
-            assert head.text in node['text']
-            if head.text != node['text']:
-                head.string = node['text']
-            node['line'] = head.sourceline
+            if head:
+                assert head.text in node['text']
+                if head.text != node['text']:
+                    head.string = node['text']
+                node['line'] = head.sourceline
 
 
 def set_outline_level(p, level):
@@ -139,6 +140,18 @@ def set_outline_level(p, level):
     new_outline_lvl = oxml.OxmlElement('w:outlineLvl')
     new_outline_lvl.set(qn('w:val'), str(min(8, level - 1)) if level else '-1')
     p_pr.append(new_outline_lvl)
+
+
+def get_outline_level(p):
+    """得到文档段落的大纲级别，0为正文文本"""
+    p_element = p._p
+    p_pr = p_element.find(qn('w:pPr'))
+    if p_pr is None:
+        return 0
+    outline_lvl = p_pr.find(qn('w:outlineLvl'))
+    if outline_lvl is None:
+        return 0
+    return int(outline_lvl.get(qn('w:val'))) + 1
 
 
 def output_doc(juan, doc, book, types):
@@ -163,11 +176,13 @@ def output_doc(juan, doc, book, types):
         if 'xu' in p_cls:
             p_types.add('xu')
         if (p.name == 'p' or 'text_paragraph' in p_cls or 'juan-begin' in p_cls) and p.text:
-            if 'head' in p_cls and '2.1.3 約所詮辨異' in p.text:
+            if 0 and 'head' in p_cls and '2.1.3 約所詮辨異' in p.text:
                 add_final_vol(doc)
             dp = output_p(doc, p, p_types)
             count += 1
         elif p.name == 'div':
+            if p.sourceline >= data['max_line']:
+                break
             sub_n = output_doc(juan, doc, p, p_types)
             if sub_n:
                 count += sub_n
@@ -177,18 +192,22 @@ def output_doc(juan, doc, book, types):
 
         if dp:
             pick_0236(juan, doc, dp)
-            mark_shu_chao_underline(dp)
+            if dp.style.name == '卷' and '(!' in dp.text:
+                m = re.search(r'\s?\(!(.+\))', dp.text)
+                doc.add_paragraph('(' + m.group(1), '卷注')
+                dp.text = dp.text.replace(m.group(), '')
+            mark_shu_chao_underline(dp, juan)
 
     return count
 
 
-def mark_shu_chao_underline(dp):
+def mark_shu_chao_underline(dp, juan):
     """根据疏钞段落的【标记】设置下划线"""
     m = re_p_tag.search(dp.text)
     tag = m.group() if m else ''
     text = dp.text[len(tag):]
     dp.clear()
-    if data['test'] and dp.style.name[0] in '疏钞经':
+    if data['test'] and juan < 9 and dp.style.name[0] in '疏钞经':
         dp.add_run(f"{data['p_n']:04d}{'' if tag else ' '}", '段号')
     if tag:
         dp.add_run(tag)
@@ -207,16 +226,19 @@ def output_p(doc, el, types):
     kp = 'head' in p_cls
     p_style = '科判' if kp else '卷' if 'juan-begin' in p_cls else ''
     if not p_style and types:
-        if 'shu' in types:
-            p_style = '疏'
-        elif 'chao' in types:
+        if 'chao' in types:
             p_style = '钞'
+        elif 'shu' in types:
+            p_style = '疏'
         elif 'jing' in types or re_jing.search(el.text):
             p_style = '经'
 
     for r in el.find_all('ruby'):
-        r.string = f'({r.text.strip()})'
+        rt = r.find('rt')
+        r.string = f"(!{rt.text + '，' if rt else ''}{r.text.strip()})"
     text = fix_kuo(el.text)
+    if not text:
+        return None
 
     level = kp and re_kp_level.search(text)
     m = re_p_tag2.search(text)
@@ -233,11 +255,37 @@ def output_p(doc, el, types):
     p = doc.add_paragraph(text, p_style or '段落')
     if level:
         set_outline_level(p, int(level.group()))
-    if 'juan-end-end' in p_cls:
-        set_outline_level(p, 1)
-        p.alignment = doc_t.WD_PARAGRAPH_ALIGNMENT.RIGHT
+    if p_style == '卷':
+        fix_kp_level()
+        data.update(dict(juan_p=p, kp_ps=[]))
+    elif p_style == '科判' and 'kp_ps' in data:
+        data['kp_ps'].append((p, int(level.group()) if level else 40))
     el.string = ''
     return p
+
+
+def fix_kp_level():
+    """修正一卷中的科判级别，让其有4级项"""
+    if not data.get('kp_ps'):
+        return
+    off, min_level = 0, min([p[1] for p in data['kp_ps']])
+    while 4 < min_level < 40 and off < 3:
+        lv4 = 0
+        for p, level in data['kp_ps']:
+            level -= min_level + off - 4
+            if level <= 4:
+                lv4 += 1
+                if lv4 > 4:
+                    continue
+            set_outline_level(p, level)
+        if lv4 > 1:
+            break
+        off += 1
+    if data.get('remove_kp5'):
+        for p, _ in data['kp_ps']:
+            level = get_outline_level(p)
+            if level > 4:
+                set_outline_level(p, 0)
 
 
 def fix_kuo(text):
@@ -257,8 +305,7 @@ def fix_kuo_embed(m):
 
 def add_final_vol(doc):
     """添加下册分隔段落"""
-    p = doc.add_paragraph('华严经疏钞附会玄记合编上册(终)', '疏')
-    p.alignment = doc_t.WD_PARAGRAPH_ALIGNMENT.RIGHT
+    doc.add_paragraph('华严经疏钞附会玄记合编上册(终)', '卷尾')
 
     p = doc.add_paragraph('华严经疏钞附会玄记合编 下册', '科判')
     p.alignment = doc_t.WD_PARAGRAPH_ALIGNMENT.CENTER
@@ -283,7 +330,7 @@ def pick_0236(juan, doc, p):
         if scj and '会' in data.get('last_p_type', ''):  # 疏钞与前面的会隔开
             p.insert_paragraph_before('', '空行')
         data['last_p_type'] = data['last_type0'] = p.style.name
-    if not scj:
+    if not scj or juan > 8:
         return 0
     data['p_n'] += 1  # p_n、last_type0 为当前疏钞经的段号、类型
 
@@ -480,7 +527,7 @@ def update_terms_by_force(force, orgs, p, pu):
                     ins_i += 1
             else:
                 s = re_punc.sub('', force[i + 1])
-                if s in re_punc.sub('', p.text) and not re.search('^[“○。]|[；。，、]$', force[i + 1]):
+                if s in re_punc.sub('', p.text) and not re.search('^[“○。]|[；。，、”]$', force[i + 1]):
                     print(f"{pu['head']} 的 force 标点可能需修正", data['p_n'], force[i + 1] + '\n',
                           p.text[p.text.index(s[0]):][:150])
                 orgs.clear()
@@ -511,23 +558,28 @@ def add_runs_u(p, text, underline=True, bold=True, first_miss=False, exists=None
     texts = re_p_tags.split(text)
     n, last = 0, None
     for i, txt in enumerate(texts):
-        if i:
-            j = text.index('】', n)
+        if i:  # 【...】| (!...)
+            assert text[n] in '【('
+            j = text.index(')' if text[n] == '(' else '】', n)
             s = text[n + 1: j]
-            if re_term.match(s):
-                p.add_run('言')
-                r = p.add_run(s[1:-1])
-                last = p.add_run('者')
+            if text[n] == '(':
+                s = s.strip('!')
+                last = p.add_run(s, 'note')
             else:
-                if last and last.underline:
-                    p.add_run(' ').font.size = Pt(7)
-                r = last = p.add_run(s)
-            if underline:
-                if first_miss:
-                    first_miss = False
-                    r.italic = True
-                r.underline = True
-                r.bold = bold and not (exists and s in exists)
+                if re_term.match(s):
+                    p.add_run('言')
+                    r = p.add_run(s[1:-1])
+                    last = p.add_run('者')
+                else:
+                    if last and last.underline:
+                        p.add_run(' ').font.size = Pt(7)
+                    r = last = p.add_run(s)
+                if underline:
+                    if first_miss:
+                        first_miss = False
+                        r.italic = True
+                    r.underline = True
+                    r.bold = bold and not (exists and s in exists)
             n = j + 1
         if txt:
             cjk_b, cjk_c = re_cjk_b.findall(txt), re_cjk_c.findall(txt)
@@ -710,19 +762,22 @@ def save_used(pu):
             h0 = h
 
 
-def main(release=0, min_juan0=0, max_juan0=10, kp_build=0, gen_origin=0, diff_hui=0, mark_shu=1):
+def main(release=0, min_juan0=0, max_juan0=9, kp_build=0, gen_origin=0,
+         diff_hui=0, mark_shu=1, remove_kp5=1):
     """
     文档生成的主函数
     :param release: 是否生成发布用的文档
-    :param min_juan0: 是否生成校对文档的起始卷号
-    :param max_juan0: 是否生成校对文档的结束卷号
+    :param min_juan0: 生成校对文档的起始疏钞卷号
+    :param max_juan0: 生成校对文档的结束疏钞卷号，不含此卷
     :param kp_build: 是否重新生成科判json文件
     :param gen_origin: 是否根据下载的 X0236 网页生成会玄记原始内容文件 pu-origin.csv
     :param diff_hui: 是否根据会玄记原始内容文件 pu-origin.csv 对比当前 hui 下的内容
     :param mark_shu: 生成校对文档时是否将会玄记引用词在疏钞段中匹配文本加下划线
+    :param remove_kp5: 是否对大纲级别超过4的科判断设置为正文级别，用于阅读器
     """
     data.update(dict(test=not release, gen_origin=gen_origin, diff_hui=diff_hui,
-                     min_juan0=min_juan0, max_juan0=max_juan0, mark_shu=mark_shu))
+                     min_juan0=min_juan0, max_juan0=max_juan0,
+                     mark_shu=mark_shu, remove_kp5=remove_kp5))
     if data.get('diff_hui'):
         with open('pu-origin.csv', encoding='utf-8') as f:
             data['origin'] = [r.strip().split(',') for r in f.readlines()[1:]]
@@ -734,8 +789,9 @@ def main(release=0, min_juan0=0, max_juan0=10, kp_build=0, gen_origin=0, diff_hu
     if not kp_build:
         with open('hysc.json', encoding='utf-8') as f:
             kp_map = json.load(f)
-        data['p_n'] = data.get('shu_para0', 1) - 1 if data['test'] else 0
-        data['pu'] = load_0236('./hui')
+        if min_juan0 < 9:
+            data['p_n'] = data.get('shu_para0', 1) - 1 if data['test'] else 0
+            data['pu'] = load_0236('./hui')
 
     for fn in sorted(glob('./shu/*.html')):
         juan = int(re.search(r'juan(\d+)\.html', fn).group(1))
@@ -752,14 +808,18 @@ def main(release=0, min_juan0=0, max_juan0=10, kp_build=0, gen_origin=0, diff_hu
         book = soup.find('div', id='main')
         add_head_level(kp_map, book, str(juan))
         if juan > 0:
-            for s in book.select('.juan-begin>p,.juan-begin>.text_paragraph,.juan-end,.noteAnchor,.double-circle'):
+            for s in book.select('p.ignore,.juan-begin>p,.juan-begin>.text_paragraph,.juan-end,.noteAnchor,.double-circle'):
                 s.extract()
+            back = soup.find('div', id='back')
+            data['max_line'] = back.sourceline
             output_doc(juan, doc, book, set())
 
     if kp_build:
         with open('hysc.json', 'w', encoding='utf-8') as f:
             json.dump(dict(tree=kp_map['tree'], id2node=kp_map['id2node']), f, ensure_ascii=False, indent=2)
     else:
+        fix_kp_level()
+        doc.add_paragraph(data['juan_p'].text + '(终)', '卷尾')
         doc.save(f"合编{'' if data['test'] else '-'}.docx")
         save_used(data['pu'])
 
